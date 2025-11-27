@@ -34,43 +34,7 @@ def parse_repo_url(repo_url: str):
     except Exception as e:
         raise ValueError(f"Invalid GitHub repo URL: {e}")
 
-
-@app.post("/summarize")
-def summarize(req: SummarizeRequest):
-    try:
-        owner, repo = parse_repo_url(req.repo_url)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-    headers = {"Accept": "application/vnd.github+json"}
-    token = os.getenv("GITHUB_TOKEN")
-    if token:
-        headers["Authorization"] = f"token {token}"
-
-    api_url = f"https://api.github.com/repos/{owner}/{repo}/issues/{req.issue_number}"
-    r = requests.get(api_url, headers=headers, timeout=15)
-    if r.status_code != 200:
-        raise HTTPException(status_code=r.status_code, detail=r.text)
-    issue = r.json()
-
-    # Fetch comments (full comment objects) for the issue
-    comments_url = f"https://api.github.com/repos/{owner}/{repo}/issues/{req.issue_number}/comments"
-    rc = requests.get(comments_url, headers=headers, timeout=15)
-    if rc.status_code != 200:
-        raise HTTPException(status_code=rc.status_code, detail=rc.text)
-    comments_full = rc.json()
-    # only keep the comment body text for each comment
-    comments = [c.get("body", "") for c in comments_full]
-
-    title = issue.get("title", "(no title)")
-    body = issue.get("body", "") or ""
-
-    # Return JSON containing only the requested fields: title, body, comments
-    return {
-        "title": title,
-        "body": body,
-        "comments": comments,
-    }
+# The temporary `/summarize` endpoint was removed; use `/analyze` below.
 
 
 def _fetch_issue_data(owner: str, repo: str, issue_number: int, headers: Dict[str, str]) -> Dict[str, Any]:
@@ -109,39 +73,35 @@ def _call_gemini(prompt: str) -> str:
 
     genai.configure(api_key=api_key)
 
-    # Try using the GenerativeModel object, then fall back to top-level helpers
     resp = None
     last_err = None
+
+    # Use only `generate_content` (instance or top-level) as requested for performance
     try:
         gm = getattr(genai, "GenerativeModel", None)
         if gm:
-            model_obj = gm(model_name)
-            # Try a set of possible method names the SDK might expose
-            for method_name in ("generate_content", "generateContent", "generate_text", "generateText", "generate"):
-                fn = getattr(model_obj, method_name, None)
-                if callable(fn):
+            try:
+                model_obj = gm(model_name)
+                fn = getattr(model_obj, "generate_content", None)
+                if fn and callable(fn):
                     try:
-                        # prefer keyword args if supported
                         resp = fn(prompt=prompt, temperature=0.2, max_output_tokens=512)
                     except TypeError:
-                        try:
-                            resp = fn(prompt)
-                        except Exception as e:
-                            last_err = e
-                    break
+                        resp = fn(prompt)
+                else:
+                    last_err = AttributeError("GenerativeModel has no generate_content method")
+            except Exception as e:
+                last_err = e
         else:
-            # top-level helper fallback
-            for fn_name in ("generate_text", "generateText", "generate", "generate_content", "generateContent"):
-                fn = getattr(genai, fn_name, None)
-                if callable(fn):
-                    try:
-                        resp = fn(model=model_name, prompt=prompt, temperature=0.2, max_output_tokens=512)
-                    except TypeError:
-                        try:
-                            resp = fn(model=model_name, input=prompt)
-                        except Exception as e:
-                            last_err = e
-                    break
+            # top-level helper
+            fn = getattr(genai, "generate_content", None)
+            if fn and callable(fn):
+                try:
+                    resp = fn(model=model_name, prompt=prompt, temperature=0.2, max_output_tokens=512)
+                except TypeError:
+                    resp = fn(model=model_name, input=prompt)
+            else:
+                last_err = AttributeError("SDK module has no generate_content function")
     except Exception as e:
         last_err = e
 
@@ -149,7 +109,7 @@ def _call_gemini(prompt: str) -> str:
         msg = "SDK call failed"
         if last_err:
             msg += ": " + str(last_err)
-        msg += ". Ensure the SDK and model are available to your project. Call ListModels to inspect available models."
+        msg += ". Ensure the SDK exposes generate_content and the model is available to your project."
         raise RuntimeError(msg)
 
     # Extract text from typical SDK response shapes and coerce to string
@@ -416,9 +376,6 @@ def analyze(req: SummarizeRequest):
         raise HTTPException(status_code=502, detail="Model returned JSON but missing required keys")
 
     return result
-
-
-# Note: single `/summarize` endpoint now returns the summary plus full `comments` array.
 
 
 if __name__ == "__main__":
