@@ -62,7 +62,7 @@ uvicorn backend:app --reload --port 8000
 streamlit run app.py
 ```
 
-3) In the UI, enter a public GitHub repo URL (for example `https://github.com/facebook/react`) and an issue number, then click Submit. The UI will call the backend `/analyze` endpoint and show the formatted analysis.
+3) In the UI, paste a full GitHub issue URL (for example `https://github.com/facebook/react/issues/35225`) and click Submit. The UI will call the backend `/analyze` endpoint and show the formatted analysis.
 
 Output format
 - The backend returns a JSON object with these keys:

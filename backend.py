@@ -8,19 +8,36 @@ import re
 from typing import Dict, Any
 from dotenv import load_dotenv
 
-load_dotenv()   # loads variables from .env into os.environ
+# Load environment variables from a local .env file (if present).
+# This keeps secrets out of source control while allowing local development.
+load_dotenv()
 
 
 class SummarizeRequest(BaseModel):
-    repo_url: str
-    issue_number: int
+        """Pydantic model for the `/analyze` request payload.
+
+        Fields:
+            - repo_url: canonical GitHub repo URL (e.g. https://github.com/owner/repo)
+            - issue_number: integer issue number
+        """
+        repo_url: str
+        issue_number: int
 
 
 app = FastAPI()
 
 
 def parse_repo_url(repo_url: str):
-    """Return (owner, repo) from a standard GitHub repo URL."""
+    """Return (owner, repo) from a standard GitHub repo URL.
+
+    This function normalizes common input variants and validates the hostname.
+    It accepts:
+      - https://github.com/owner/repo
+      - github.com/owner/repo
+      - git@github.com:owner/repo.git (scp-style SSH)
+
+    It raises ValueError with a helpful message on invalid inputs.
+    """
     try:
         if not repo_url or not isinstance(repo_url, str):
             raise ValueError("Empty or invalid repo_url")
@@ -28,7 +45,7 @@ def parse_repo_url(repo_url: str):
         # Normalize backslashes (e.g. pasted Windows paths) to forward slashes
         repo_url = repo_url.strip().replace("\\", "/")
 
-        # Handle scp-like SSH URLs: git@github.com:owner/repo.git -> ssh://git@github.com/owner/repo.git
+        # Handle scp-like SSH URLs (git@github.com:owner/repo.git -> ssh://git@github.com/owner/repo.git)
         if "@" in repo_url and ":" in repo_url and not repo_url.startswith(("http://", "https://", "ssh://")):
             # only replace the first ':' to convert host:path -> host/path
             repo_url = repo_url.replace(":", "/", 1)
@@ -52,22 +69,27 @@ def parse_repo_url(repo_url: str):
         if len(parts) < 2:
             raise ValueError("Unable to parse owner/repo from URL")
         owner, repo = parts[0], parts[1]
+        # Strip a trailing .git if present
         if repo.endswith('.git'):
             repo = repo[:-4]
         return owner, repo
     except Exception as e:
+        # Wrap any error with a clear high-level message
         raise ValueError(f"Invalid GitHub repo URL: {e}")
 
 # The temporary `/summarize` endpoint was removed; use `/analyze` below.
 
 
 def _fetch_issue_data(owner: str, repo: str, issue_number: int, headers: Dict[str, str]) -> Dict[str, Any]:
+    # Fetch the main issue payload (title, body, labels, etc.)
     api_url = f"https://api.github.com/repos/{owner}/{repo}/issues/{issue_number}"
     r = requests.get(api_url, headers=headers, timeout=15)
     if r.status_code != 200:
+        # Surface GitHub errors to the client with the same status code
         raise HTTPException(status_code=r.status_code, detail=r.text)
     issue = r.json()
 
+    # Fetch comments separately; current implementation fetches the first page only
     comments_url = f"https://api.github.com/repos/{owner}/{repo}/issues/{issue_number}/comments"
     rc = requests.get(comments_url, headers=headers, timeout=15)
     if rc.status_code != 200:
@@ -89,18 +111,20 @@ def _call_gemini(prompt: str) -> str:
     if model_name.startswith("models/"):
         model_name = model_name.split("/", 1)[1]
 
-    # Use the official SDK if available
+    # Use the official SDK if available and prefer the `generate_content` method
     try:
         import google.generativeai as genai
     except Exception:
         raise RuntimeError("google-generative-ai SDK not installed: install with `pip install google-generative-ai`")
 
+    # Configure SDK with the API key from environment
     genai.configure(api_key=api_key)
 
     resp = None
     last_err = None
 
-    # Use only `generate_content` (instance or top-level) as requested for performance
+    # Use only `generate_content` (instance or top-level) as requested for performance.
+    # The code supports either a GenerativeModel instance or a top-level helper depending on SDK shape.
     try:
         gm = getattr(genai, "GenerativeModel", None)
         if gm:
@@ -111,6 +135,7 @@ def _call_gemini(prompt: str) -> str:
                     try:
                         resp = fn(prompt=prompt, temperature=0.2, max_output_tokens=512)
                     except TypeError:
+                        # Fallback for SDKs that accept different param names
                         resp = fn(prompt)
                 else:
                     last_err = AttributeError("GenerativeModel has no generate_content method")
@@ -136,10 +161,10 @@ def _call_gemini(prompt: str) -> str:
         msg += ". Ensure the SDK exposes generate_content and the model is available to your project."
         raise RuntimeError(msg)
 
-    # Extract text from typical SDK response shapes and coerce to string
+    # Extract text from typical SDK response shapes and coerce to string for downstream parsing.
     result_text = None
     try:
-        # object-like response
+        # object-like response with candidates list
         if hasattr(resp, "candidates") and resp.candidates:
             first = resp.candidates[0]
             candidate_val = getattr(first, "output", None) or getattr(first, "content", None) or first
@@ -154,6 +179,7 @@ def _call_gemini(prompt: str) -> str:
                 else:
                     result_text = getattr(c0, "output", None) or getattr(c0, "content", None) or c0
             else:
+                # Try common keys for textual content
                 for k in ("output", "content", "text"):
                     if k in resp:
                         result_text = resp.get(k)
@@ -166,13 +192,12 @@ def _call_gemini(prompt: str) -> str:
     if result_text is None:
         result_text = resp
 
-    # Coerce to plain string for callers
+    # Coerce to plain string for callers; handle bytes and various SDK object shapes
     try:
         if isinstance(result_text, bytes):
             return result_text.decode("utf-8", errors="ignore")
         if isinstance(result_text, str):
             return result_text
-        # Some SDK objects may have `.text` or `.content` attributes
         if hasattr(result_text, "text"):
             return str(result_text.text)
         if hasattr(result_text, "content"):
@@ -185,11 +210,11 @@ def _call_gemini(prompt: str) -> str:
 
 
 def _extract_json(text: Any) -> Any:
-    # Coerce common SDK/response objects to strings before parsing
+    # Coerce common SDK/response objects to strings before parsing JSON.
     if text is None:
         raise ValueError("No text to parse")
 
-    # If the object has a textual attribute, prefer that
+    # Prefer existing textual attributes if present on SDK response objects
     if not isinstance(text, (str, bytes)):
         try:
             if hasattr(text, "text"):
@@ -217,6 +242,7 @@ def _extract_json(text: Any) -> Any:
     if isinstance(text, bytes):
         text = text.decode("utf-8", errors="ignore")
 
+    # First try strict JSON parsing; if that fails, attempt to extract a JSON object using regex
     try:
         return json.loads(text)
     except Exception:
@@ -257,7 +283,7 @@ def _recover_json_from_text(text: Any) -> Dict[str, Any]:
         else:
             s_inner = s
 
-    # Now try to find fields with regex (allow newlines)
+    # Helper functions to locate fields inside messy text
     def find_str(key):
         pat = rf'"{key}"\s*:\s*"([\s\S]*?)"'
         mm = re.search(pat, s_inner, re.S)
@@ -278,7 +304,7 @@ def _recover_json_from_text(text: Any) -> Dict[str, Any]:
             return json.loads(arr_text)
         except Exception:
             # fallback: extract quoted strings
-            items = re.findall(r'"([^"]+)"', arr_text)
+            items = re.findall(r'"([^\"]+)"', arr_text)
             return items
 
     summary = find_str("summary") or ""
@@ -294,7 +320,7 @@ def _recover_json_from_text(text: Any) -> Dict[str, Any]:
         mm = re.search(r'suggested_labels\s*:\s*([^\n\r]*)', s_inner)
         if mm:
             txt = mm.group(1)
-            labels = re.findall(r'"([^"]+)"|\b([a-zA-Z0-9_\-]+)\b', txt)
+            labels = re.findall(r'"([^\"]+)"|\b([a-zA-Z0-9_\-]+)\b', txt)
             flattened = [a or b for (a, b) in labels]
             suggested_labels = flattened[:3]
 
@@ -324,7 +350,7 @@ def _synthesize_justification(summary: str, priority_score: int, issue_type: str
     )
     try:
         resp = _call_gemini(prompt)
-        # resp should be a string
+        # resp should be a string; normalize whitespace
         s = str(resp).strip()
         # Keep only the first sentence if multi-sentence
         s = re.split(r"[\n\.]{1,}\s*", s)[0].strip()
@@ -334,9 +360,10 @@ def _synthesize_justification(summary: str, priority_score: int, issue_type: str
                 s = s + '.'
             return s
     except Exception:
+        # If model call fails, fall through to deterministic fallback
         pass
 
-    # deterministic fallback
+    # Deterministic fallback justification when the model cannot provide one.
     return (
         "Although not crash-causing, limited type-aware mutation detection and ignored method calls "
         "increase the risk of subtle state-mutation bugs that can lead to unexpected UI behavior."
@@ -345,18 +372,22 @@ def _synthesize_justification(summary: str, priority_score: int, issue_type: str
 
 @app.post("/analyze")
 def analyze(req: SummarizeRequest):
+    # Parse and validate the repo URL provided by the client
     try:
         owner, repo = parse_repo_url(req.repo_url)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+    # Prepare GitHub request headers. Optionally include token for higher rate limits/private repos.
     headers = {"Accept": "application/vnd.github+json"}
     token = os.getenv("GITHUB_TOKEN")
     if token:
         headers["Authorization"] = f"token {token}"
 
+    # Fetch issue title/body/comments from GitHub
     data = _fetch_issue_data(owner, repo, req.issue_number, headers)
 
+    # Build a deterministic prompt instructing the LLM to return strict JSON
     prompt = (
         "You are an assistant that analyzes a GitHub issue.\n"
         "Given the issue title, body, and comments, return ONLY a JSON object with the following keys:\n"
@@ -371,11 +402,14 @@ def analyze(req: SummarizeRequest):
         "For 'potential_impact', return a brief sentence about user impact if this is a bug.\n"
     )
 
+    # Call the LLM SDK and get a raw textual response
     try:
         raw = _call_gemini(prompt)
     except RuntimeError as e:
+        # Bubble SDK/runtime errors to the client as a 502 Bad Gateway
         raise HTTPException(status_code=502, detail=str(e))
 
+    # Try to parse strict JSON first; if that fails, attempt heuristic recovery
     try:
         result = _extract_json(raw)
     except ValueError:
@@ -385,16 +419,20 @@ def analyze(req: SummarizeRequest):
             recovered = _recover_json_from_text(raw_str)
             # Ensure required keys exist
             required = {"summary", "type", "priority_score", "justification", "suggested_labels", "potential_impact"}
-            # Fill missing optional fields and synthesize justification if needed
+            # Fill missing fields and synthesize justification if needed
             for k in required:
                 if k not in recovered:
                     recovered[k] = "" if k != "suggested_labels" else []
             if not recovered.get("justification"):
-                recovered["justification"] = _synthesize_justification(recovered.get("summary", ""), recovered.get("priority_score", 3), recovered.get("type", "other"))
+                recovered["justification"] = _synthesize_justification(
+                    recovered.get("summary", ""), recovered.get("priority_score", 3), recovered.get("type", "other")
+                )
             return recovered
         except Exception:
+            # If recovery fails, return a 502 with a short excerpt of the raw model output
             raise HTTPException(status_code=502, detail="Model did not return valid JSON: " + raw_str[:1000])
 
+    # Validate the final result contains all required keys
     required = {"summary", "type", "priority_score", "justification", "suggested_labels", "potential_impact"}
     if not isinstance(result, dict) or not required.issubset(set(result.keys())):
         raise HTTPException(status_code=502, detail="Model returned JSON but missing required keys")
