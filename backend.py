@@ -22,7 +22,31 @@ app = FastAPI()
 def parse_repo_url(repo_url: str):
     """Return (owner, repo) from a standard GitHub repo URL."""
     try:
+        if not repo_url or not isinstance(repo_url, str):
+            raise ValueError("Empty or invalid repo_url")
+
+        # Normalize backslashes (e.g. pasted Windows paths) to forward slashes
+        repo_url = repo_url.strip().replace("\\", "/")
+
+        # Handle scp-like SSH URLs: git@github.com:owner/repo.git -> ssh://git@github.com/owner/repo.git
+        if "@" in repo_url and ":" in repo_url and not repo_url.startswith(("http://", "https://", "ssh://")):
+            # only replace the first ':' to convert host:path -> host/path
+            repo_url = repo_url.replace(":", "/", 1)
+            repo_url = "ssh://" + repo_url
+
         parsed = urlparse(repo_url)
+
+        # If no scheme (e.g. github.com/owner/repo), assume https
+        if not parsed.scheme:
+            repo_url = "https://" + repo_url
+            parsed = urlparse(repo_url)
+
+        # Require the host be GitHub to avoid ambiguous inputs
+        hostname = (parsed.hostname or "").lower()
+        allowed_hosts = {"github.com", "www.github.com"}
+        if hostname not in allowed_hosts:
+            raise ValueError(f"Repository URL must be on github.com (got host '{hostname}')")
+
         # path like /owner/repo or /owner/repo/
         parts = [p for p in parsed.path.split("/") if p]
         if len(parts) < 2:
