@@ -35,6 +35,7 @@ If `pip` cannot find `google-generative-ai` in your environment, consult Google 
 
 Environment variables
 - `GOOGLE_API_KEY` — API key for Generative Models (required for LLM calls). Also accepts `GEMINI_API_KEY` if you prefer that name in your environment.
+	- Note: this repository does NOT include a Google/Gemini API key for security reasons. You must create and use your own API key and set it in your local `.env`. If you require a project-specific key, contact the repository owner to request access (do NOT share keys in public channels).
 - `GEMINI_MODEL` — Optional model id (e.g. `models/gemini-1.0` or `gemini-2.5-flash`). The backend normalises names that start with `models/`.
 - `GITHUB_TOKEN` — Optional GitHub personal access token to increase API rate limits and access private repos (if needed). Keep this secret and do not expose it client-side.
 	- Generate a token: go to GitHub -> Settings -> Developer settings -> Personal access tokens -> Generate new token. For public repo access the `public_repo` scope is sufficient; add `repo` if you need private repo access.
