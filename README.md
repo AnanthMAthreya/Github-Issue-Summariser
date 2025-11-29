@@ -16,6 +16,7 @@ Requirements
 - Recommended: create and activate a virtual environment before installing packages.
 
 Install
+ - Clone the repository
  - From the project root:
 
 ```powershell
