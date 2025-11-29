@@ -73,8 +73,11 @@ def parse_repo_url(repo_url: str):
         if repo.endswith('.git'):
             repo = repo[:-4]
         return owner, repo
+    except ValueError:
+        # Preserve ValueError messages raised above so callers see the specific reason
+        raise
     except Exception as e:
-        # Wrap any error with a clear high-level message
+        # Wrap any unexpected error with a high-level message
         raise ValueError(f"Invalid GitHub repo URL: {e}")
 
 # The temporary `/summarize` endpoint was removed; use `/analyze` below.

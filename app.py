@@ -45,6 +45,12 @@ def _parse_issue_url(url: str):
     # Ensure urlparse sees a scheme; default to https when missing
     parsed = urlparse(u if "://" in u else ("https://" + u))
     parts = [p for p in parsed.path.split("/") if p]
+    # Validate the hostname is github.com so frontend and backend behave consistently
+    hostname = (parsed.hostname or "").lower()
+    allowed_hosts = {"github.com", "www.github.com"}
+    if hostname not in allowed_hosts:
+        # Match backend error text so the UI shows the same message as Postman
+        raise ValueError(f"Repository URL must be on github.com (got host '{hostname}')")
     # Expect a path containing 'issues' followed by the number
     if "issues" not in parts:
         raise ValueError("URL does not look like a GitHub issue URL (missing '/issues/').")
